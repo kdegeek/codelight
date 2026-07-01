@@ -167,6 +167,35 @@ Every device running the custom firmware exposes a live debug log at
 WebSocket, incoming status) and includes a live screenshot of the current display
 state in the top-right corner, updated every second.
 
+## WinProdexBar device management backlog
+
+The screen should become fully manageable from WinProdexBar, not just manually
+configured through its built-in web page. The firmware already has
+`GET /api/config`, `POST /api/config`, `/debug`, `/api/debug/log`, `/screendump`,
+and `/update`, but WinProdexBar still needs a first-class device management flow.
+
+Planned firmware/API endpoints:
+
+- `POST /api/reboot` — reboot after config changes without touching the device.
+- `POST /api/reset` — clear saved config and reboot into setup mode.
+- `GET /api/status` — report firmware version, device name, IP, WiFi SSID/RSSI,
+  companion mode, companion connection state, last poll result, and uptime.
+- `GET /api/capabilities` — expose schema/version flags so WinProdexBar can
+  decide which controls are available.
+- `POST /api/wifi/scan` or `GET /api/wifi/scan` — list visible 2.4 GHz networks.
+- `POST /api/wifi/test` — validate SSID/password before saving and rebooting.
+- OTA management metadata around `/update` — current firmware version, upload
+  status, and clear success/failure reporting that WinProdexBar can display.
+
+Planned WinProdexBar behavior:
+
+- Discover screens on the LAN by mDNS and by manual IP.
+- Configure WiFi, companion host, and companion secret from the desktop app.
+- Trigger reboot/reset/OTA from the desktop app.
+- Show debug logs, current screenshot, firmware version, and connection health.
+- Require a management secret before exposing config-changing endpoints beyond
+  setup/AP mode.
+
 ## Multiple screens or companions on one network
 
 - **Multiple screens**: each device needs a unique device name set in its config
