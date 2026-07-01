@@ -10,6 +10,9 @@ static DisplayProviderRow emptyRow() {
     row.accent = TFT_WHITE;
     row.background = TFT_BLACK;
     row.pressurePct = 0.0f;
+    row.primaryPct = 0.0f;
+    row.secondaryPct = 0.0f;
+    row.hasSecondary = false;
     row.animated = false;
     row.rainbow = false;
     return row;
@@ -102,6 +105,9 @@ static void drawProviderMark(const DisplayAttention& attention, int x, int y, in
     row.accent = attention.accent;
     row.background = attention.background;
     row.pressurePct = 1.0f;
+    row.primaryPct = 1.0f;
+    row.secondaryPct = 0.0f;
+    row.hasSecondary = false;
     row.animated = attention.animated;
     row.rainbow = attention.rainbow;
     drawProviderMark(row, x, y, size);
@@ -147,20 +153,32 @@ static void drawRows() {
         drawProviderMark(row, X_MARGIN + 12, y + 6, 36);
 
         int barX = 58;
-        int barY = y + 20;
+        int barY = y + 17;
         int barW = 126;
-        int barH = 10;
-        float pct = constrain(row.pressurePct, 0.0f, 1.0f);
-        uint16_t fill = pressureColor(pct, row.accent);
-        tft.fillRect(barX, barY, barW, barH, COL_BG);
-        tft.fillRect(barX, barY, (int)(barW * pct), barH, fill);
+        float primaryPct = constrain(row.primaryPct, 0.0f, 1.0f);
+        float secondaryPct = constrain(row.secondaryPct, 0.0f, 1.0f);
+        tft.fillRect(barX, barY, barW, 18, COL_BG);
+        tft.fillRect(barX, barY, (int)(barW * primaryPct), 8, row.accent);
+        if (row.hasSecondary) {
+            tft.fillRect(barX, barY + 12, (int)(barW * secondaryPct), 4, pressureColor(secondaryPct, row.accent));
+        }
 
-        char buf[6];
-        snprintf(buf, sizeof(buf), "%3d%%", (int)(pct * 100.0f + 0.5f));
+        char buf[9];
+        if (row.hasSecondary) {
+            snprintf(
+                buf,
+                sizeof(buf),
+                "%d/%d%%",
+                (int)(primaryPct * 100.0f + 0.5f),
+                (int)(secondaryPct * 100.0f + 0.5f));
+        } else {
+            snprintf(buf, sizeof(buf), "%3d%%", (int)(primaryPct * 100.0f + 0.5f));
+        }
         tft.setTextFont(2);
         tft.setTextSize(1);
         tft.setTextColor(COL_TEXT, panel);
-        tft.setCursor(190, y + 16);
+        int tx = 232 - tft.textWidth(buf);
+        tft.setCursor(max(186, tx), y + 16);
         tft.print(buf);
     }
 
@@ -249,12 +267,11 @@ static void svgCodexMark(String& s, int cx, int cy, const String& fill) {
 
 static void svgClaudeMark(String& s, int cx, int cy, const String& fill) {
     s += "<circle cx='"; s += cx; s += "' cy='"; s += cy; s += "' r='18' fill='#050200'/>";
-    s += "<path d='M"; s += cx; s += " "; s += (cy - 18); s += " L"; s += (cx + 5); s += " "; s += (cy - 5);
-    s += " L"; s += (cx + 18); s += " "; s += cy; s += " L"; s += (cx + 5); s += " "; s += (cy + 5);
-    s += " L"; s += cx; s += " "; s += (cy + 18); s += " L"; s += (cx - 5); s += " "; s += (cy + 5);
-    s += " L"; s += (cx - 18); s += " "; s += cy; s += " L"; s += (cx - 5); s += " "; s += (cy - 5);
-    s += " Z' fill='"; s += fill; s += "'/>";
-    s += "<circle cx='"; s += cx; s += "' cy='"; s += cy; s += "' r='4' fill='#050200'/>";
+    const int pts[][2] = {{0,-13},{9,-9},{13,0},{9,9},{0,13},{-9,9},{-13,0},{-9,-9}};
+    for (auto& pt : pts) {
+        s += "<circle cx='"; s += (cx + pt[0]); s += "' cy='"; s += (cy + pt[1]); s += "' r='5' fill='"; s += fill; s += "'/>";
+    }
+    s += "<circle cx='"; s += cx; s += "' cy='"; s += cy; s += "' r='5' fill='"; s += fill; s += "'/>";
 }
 
 static void svgOllamaMark(String& s, int cx, int cy, const String& fill) {
@@ -305,15 +322,25 @@ String generateScreenSvg() {
         for (uint8_t i = 0; i < displayData.providerCount && i < MAX_DISPLAY_PROVIDERS; i++) {
             const DisplayProviderRow& row = displayData.providers[i];
             int y = ROW_TOP + i * ROW_H;
-            int filled = (int)(126 * constrain(row.pressurePct, 0.0f, 1.0f));
+            float primaryPct = constrain(row.primaryPct, 0.0f, 1.0f);
+            float secondaryPct = constrain(row.secondaryPct, 0.0f, 1.0f);
+            int primaryFilled = (int)(126 * primaryPct);
+            int secondaryFilled = (int)(126 * secondaryPct);
             s += "<rect x='8' y='"; s += y; s += "' width='224' height='48' rx='5' fill='"; s += colorHex(dimColor(row.background)); s += "'/>";
             s += "<rect x='8' y='"; s += y; s += "' width='6' height='48' fill='"; s += colorHex(row.accent); s += "'/>";
             svgProviderMark(s, row.provider, 38, y + 24, colorHex(row.accent));
-            s += "<rect x='58' y='"; s += (y + 20); s += "' width='126' height='10' fill='#000'/>";
-            s += "<rect x='58' y='"; s += (y + 20); s += "' width='"; s += filled; s += "' height='10' fill='"; s += colorHex(pressureColor(row.pressurePct, row.accent)); s += "'/>";
-            char buf[6];
-            snprintf(buf, sizeof(buf), "%d%%", (int)(row.pressurePct * 100.0f + 0.5f));
-            svgText(s, 218, y + 32, "#fff", 13, "end", buf);
+            s += "<rect x='58' y='"; s += (y + 17); s += "' width='126' height='18' fill='#000'/>";
+            s += "<rect x='58' y='"; s += (y + 17); s += "' width='"; s += primaryFilled; s += "' height='8' fill='"; s += colorHex(row.accent); s += "'/>";
+            if (row.hasSecondary) {
+                s += "<rect x='58' y='"; s += (y + 29); s += "' width='"; s += secondaryFilled; s += "' height='4' fill='"; s += colorHex(pressureColor(secondaryPct, row.accent)); s += "'/>";
+            }
+            char buf[9];
+            if (row.hasSecondary) {
+                snprintf(buf, sizeof(buf), "%d/%d%%", (int)(primaryPct * 100.0f + 0.5f), (int)(secondaryPct * 100.0f + 0.5f));
+            } else {
+                snprintf(buf, sizeof(buf), "%d%%", (int)(primaryPct * 100.0f + 0.5f));
+            }
+            svgText(s, 230, y + 32, "#fff", 13, "end", buf);
         }
     }
     s += "</svg>";

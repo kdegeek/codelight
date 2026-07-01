@@ -68,11 +68,13 @@ def codex() -> list[list[int]]:
 
 def claude() -> list[list[int]]:
     c = blank()
-    pts = [(16, 2), (20, 12), (30, 16), (20, 20), (16, 30), (12, 20), (2, 16), (12, 12)]
-    poly(c, pts, thick=1)
-    circle(c, 16, 16, 3)
-    line(c, 16, 5, 16, 27)
-    line(c, 5, 16, 27, 16)
+    for deg in range(0, 360, 45):
+        rad = deg * pi / 180
+        x = round(16 + cos(rad) * 10)
+        y = round(16 + sin(rad) * 10)
+        line(c, 16, 16, x, y, thick=1)
+        point(c, x, y, 3)
+    point(c, 16, 16, 4)
     return c
 
 

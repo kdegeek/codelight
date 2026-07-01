@@ -88,6 +88,24 @@ static void applyDisplayPayload(const String& payload) {
         DisplayProviderRow& row = displayData.providers[displayData.providerCount++];
         row.provider = item["provider"].as<String>();
         row.pressurePct = constrain((float)((item["pressurePercent"] | 0.0) / 100.0), 0.0f, 1.0f);
+        row.primaryPct = row.pressurePct;
+        row.secondaryPct = 0.0f;
+        row.hasSecondary = false;
+        bool primarySet = false;
+        JsonArray windows = item["windows"].as<JsonArray>();
+        for (JsonObject window : windows) {
+            String id = window["id"].as<String>();
+            String kind = window["kind"].as<String>();
+            float pct = constrain((float)((window["usedPercent"] | 0.0) / 100.0), 0.0f, 1.0f);
+            if (id == "primary" || kind == "session") {
+                row.primaryPct = pct;
+                primarySet = true;
+            } else {
+                row.secondaryPct = max(row.secondaryPct, pct);
+                row.hasSecondary = true;
+            }
+        }
+        if (!primarySet) row.primaryPct = row.pressurePct;
         applyIdentity(row, item["identity"].as<JsonObject>());
     }
 

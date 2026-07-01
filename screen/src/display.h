@@ -18,6 +18,9 @@ struct DisplayProviderRow {
     uint16_t accent;
     uint16_t background;
     float pressurePct;   // 0.0-1.0
+    float primaryPct;    // 0.0-1.0
+    float secondaryPct;  // 0.0-1.0, highest non-primary quota window
+    bool hasSecondary;
     bool animated;
     bool rainbow;
 };
