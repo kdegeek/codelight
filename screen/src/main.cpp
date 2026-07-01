@@ -2,6 +2,7 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266mDNS.h>
 #include <ESPAsyncWebServer.h>
+#include <ESP8266HTTPClient.h>
 #include <ElegantOTA.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
@@ -21,6 +22,9 @@ static bool          wsAuthFailed     = false;
 static unsigned long wsLastDiscoverMs = 0;
 #define WS_DISCOVER_MS 15000UL
 
+static unsigned long httpLastPollMs = 0;
+#define HTTP_POLL_MS 30000UL
+
 static unsigned long lastClockMs = 0;
 static bool          displayReady = false;
 
@@ -31,15 +35,161 @@ static const char* ntpServer = "pool.ntp.org";
 #define DISPLAY_OK     0x12345678u
 #define DISPLAY_TRYING 0xDEADBEEFu
 
+static uint16_t rgb888To565(uint8_t r, uint8_t g, uint8_t b) {
+    return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+}
+
+static uint8_t hexNibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return 0;
+}
+
+static uint16_t parseColor565(const char* raw, uint16_t fallback) {
+    if (!raw || raw[0] != '#' || strlen(raw) < 7) return fallback;
+    uint8_t r = (hexNibble(raw[1]) << 4) | hexNibble(raw[2]);
+    uint8_t g = (hexNibble(raw[3]) << 4) | hexNibble(raw[4]);
+    uint8_t b = (hexNibble(raw[5]) << 4) | hexNibble(raw[6]);
+    return rgb888To565(r, g, b);
+}
+
+static String defaultMark(const String& provider) {
+    if (provider == "codex") return "C";
+    if (provider == "claude") return "C";
+    if (provider == "ollama") return "O";
+    if (provider == "antigravity") return "A";
+    return provider.length() > 0 ? provider.substring(0, 1) : "?";
+}
+
+static void applyIdentity(DisplayProviderRow& row, JsonObject identity) {
+    row.accent = parseColor565(identity["accent"] | "#ffffff", TFT_WHITE);
+    row.background = parseColor565(identity["background"] | "#000000", TFT_BLACK);
+    row.mark = identity["mark"].as<String>();
+    if (row.mark.length() == 0) row.mark = defaultMark(row.provider);
+    const char* treatment = identity["treatment"] | "";
+    const char* assetState = identity["assetState"] | "";
+    row.animated = strcmp(treatment, "animated") == 0;
+    row.rainbow = strcmp(treatment, "rainbowStatic") == 0 || strcmp(assetState, "rainbow") == 0;
+}
+
+static void applyDisplayPayload(const String& payload) {
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, payload);
+    if (err) {
+        dbgLog(String("[http] bad /display payload: ") + err.c_str());
+        return;
+    }
+
+    displayData.providerCount = 0;
+    JsonArray providers = doc["providers"].as<JsonArray>();
+    for (JsonObject item : providers) {
+        if (displayData.providerCount >= MAX_DISPLAY_PROVIDERS) break;
+        DisplayProviderRow& row = displayData.providers[displayData.providerCount++];
+        row.provider = item["provider"].as<String>();
+        row.pressurePct = constrain((float)((item["pressurePercent"] | 0.0) / 100.0), 0.0f, 1.0f);
+        applyIdentity(row, item["identity"].as<JsonObject>());
+    }
+
+    JsonObject attention = doc["attention"].as<JsonObject>();
+    displayData.attention.active = !attention.isNull();
+    if (!displayData.attention.active) {
+        displayData.attention.provider = "";
+        displayData.attention.reason = "";
+        displayData.attention.action = "";
+        displayData.attention.mark = "";
+    }
+    if (displayData.attention.active) {
+        displayData.attention.provider = attention["provider"].as<String>();
+        displayData.attention.reason = attention["reason"].as<String>();
+        displayData.attention.action = attention["action"].as<String>();
+        JsonObject identity;
+        for (uint8_t i = 0; i < displayData.providerCount; i++) {
+            if (displayData.providers[i].provider == displayData.attention.provider) {
+                displayData.attention.mark = displayData.providers[i].mark;
+                displayData.attention.accent = displayData.providers[i].accent;
+                displayData.attention.background = displayData.providers[i].background;
+                displayData.attention.animated = displayData.providers[i].animated;
+                displayData.attention.rainbow = displayData.providers[i].rainbow;
+                break;
+            }
+        }
+        if (displayData.attention.mark.length() == 0) {
+            displayData.attention.mark = defaultMark(displayData.attention.provider);
+            displayData.attention.accent = TFT_WHITE;
+            displayData.attention.background = TFT_BLACK;
+            displayData.attention.animated = false;
+            displayData.attention.rainbow = false;
+        }
+    }
+
+    displayData.connected = true;
+    displayData.authFailed = false;
+    dbgLog("[http] /display rows=" + String(displayData.providerCount));
+    if (displayReady) displayUpdate();
+}
+
+static bool directHttpMode() {
+    return cfg.companionHost.length() > 0;
+}
+
+static String displayUrl() {
+    String host = cfg.companionHost;
+    String base;
+    if (host.startsWith("http://") || host.startsWith("https://")) {
+        base = host;
+    } else {
+        base = "http://" + host;
+        if (host.indexOf(':') < 0) base += ":8080";
+    }
+    String url = base + "/display?provider=all";
+    if (cfg.companionSecret.length() > 0) url += "&secret=" + cfg.companionSecret;
+    return url;
+}
+
+static void pollDisplayFeed() {
+    if (!directHttpMode() || WiFi.status() != WL_CONNECTED) return;
+
+    WiFiClient client;
+    HTTPClient http;
+    String url = displayUrl();
+    dbgLog("[http] GET /display from " + cfg.companionHost);
+    if (!http.begin(client, url)) {
+        dbgLog(F("[http] begin failed"));
+        return;
+    }
+
+    int code = http.GET();
+    if (code == HTTP_CODE_OK) {
+        applyDisplayPayload(http.getString());
+    } else if (code == HTTP_CODE_UNAUTHORIZED) {
+        dbgLog(F("[http] unauthorized - check companion secret"));
+        displayData.connected = false;
+        displayData.authFailed = true;
+        if (displayReady) displayUpdate();
+    } else {
+        dbgLog("[http] status=" + String(code));
+        displayData.connected = false;
+        if (displayReady) displayUpdate();
+    }
+    http.end();
+}
+
 static void applyStatus(uint8_t* payload, size_t length) {
     JsonDocument doc;
     if (deserializeJson(doc, payload, length)) return;
 
-    displayData.weeklyPct    = doc["weekly_pct"]   | 0.0f;
-    displayData.sessionPct   = doc["session_pct"]  | 0.0f;
-    displayData.weeklyReset  = doc["weekly_reset"].as<String>();
-    displayData.sessionReset = doc["session_reset"].as<String>();
-    displayData.sessions     = doc["sessions"]     | 0;
+    float weeklyPct = doc["weekly_pct"] | 0.0f;
+    float sessionPct = doc["session_pct"] | 0.0f;
+    displayData.providerCount = 1;
+    DisplayProviderRow& row = displayData.providers[0];
+    row.provider = "claude";
+    row.mark = "claude";
+    row.accent = parseColor565("#ff8c00", 0xFD20);
+    row.background = parseColor565("#2a1200", TFT_BLACK);
+    row.pressurePct = max(weeklyPct, sessionPct);
+    row.animated = true;
+    row.rainbow = false;
     displayData.connected    = true;
     displayData.authFailed   = false;
 
@@ -47,10 +197,27 @@ static void applyStatus(uint8_t* payload, size_t length) {
     if      (strcmp(st, "working") == 0) displayData.status = STATUS_WORKING;
     else if (strcmp(st, "waiting") == 0) displayData.status = STATUS_WAITING;
     else                                  displayData.status = STATUS_INACTIVE;
+    displayData.attention.active = displayData.status == STATUS_WAITING;
+    if (!displayData.attention.active) {
+        displayData.attention.provider = "";
+        displayData.attention.reason = "";
+        displayData.attention.action = "";
+        displayData.attention.mark = "";
+    }
+    if (displayData.attention.active) {
+        displayData.attention.provider = "claude";
+        displayData.attention.reason = "waiting";
+        displayData.attention.action = "OPEN";
+        displayData.attention.mark = row.mark;
+        displayData.attention.accent = row.accent;
+        displayData.attention.background = row.background;
+        displayData.attention.animated = true;
+        displayData.attention.rainbow = false;
+    }
 
     dbgLog(String("status=") + st +
-           " session=" + String((int)(displayData.sessionPct * 100)) + "%" +
-           " weekly="  + String((int)(displayData.weeklyPct  * 100)) + "%");
+           " session=" + String((int)(sessionPct * 100)) + "%" +
+           " weekly="  + String((int)(weeklyPct  * 100)) + "%");
 
     if (displayReady) displayUpdate();
 }
@@ -326,10 +493,15 @@ void setup() {
         displayUpdate();
     }
 
-    // --- 5. Initial WS discovery ---
+    // --- 5. Initial companion connection ---
     if (WiFi.status() == WL_CONNECTED) {
-        tryDiscover();
-        wsLastDiscoverMs = millis();
+        if (directHttpMode()) {
+            pollDisplayFeed();
+            httpLastPollMs = millis();
+        } else {
+            tryDiscover();
+            wsLastDiscoverMs = millis();
+        }
     }
 
     lastClockMs = millis();
@@ -349,12 +521,19 @@ void loop() {
     }
 
     if (WiFi.status() == WL_CONNECTED) {
-        // Re-discover companion via mDNS when not yet connected
-        if (!wsAuthFailed && !wsBegun && (now - wsLastDiscoverMs >= WS_DISCOVER_MS)) {
-            wsLastDiscoverMs = now;
-            tryDiscover();
+        if (directHttpMode()) {
+            if (now - httpLastPollMs >= HTTP_POLL_MS) {
+                httpLastPollMs = now;
+                pollDisplayFeed();
+            }
+        } else {
+            // Re-discover companion via mDNS when not yet connected
+            if (!wsAuthFailed && !wsBegun && (now - wsLastDiscoverMs >= WS_DISCOVER_MS)) {
+                wsLastDiscoverMs = now;
+                tryDiscover();
+            }
+            wsClient.loop();
         }
-        wsClient.loop();
     }
 
     yield();

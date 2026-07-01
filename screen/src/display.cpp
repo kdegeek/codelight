@@ -1,119 +1,180 @@
 #include "display.h"
 
 TFT_eSPI tft = TFT_eSPI();
-DisplayData displayData = {0, 0, "--", "--", 0, STATUS_OFFLINE, false, false};
 
-// Palette
+static DisplayProviderRow emptyRow() {
+    DisplayProviderRow row;
+    row.provider = "";
+    row.mark = "";
+    row.accent = TFT_WHITE;
+    row.background = TFT_BLACK;
+    row.pressurePct = 0.0f;
+    row.animated = false;
+    row.rainbow = false;
+    return row;
+}
+
+DisplayData displayData = {
+    {emptyRow(), emptyRow(), emptyRow(), emptyRow()},
+    0,
+    {false, "", "", "", "", TFT_WHITE, TFT_BLACK, false, false},
+    STATUS_OFFLINE,
+    false,
+    false,
+    0
+};
+
 #define COL_BG       TFT_BLACK
-#define COL_TITLE    0xFFFF
-#define COL_LABEL    0xC618   // light grey
-#define COL_BAR_BG   0x2104   // dark grey
-#define COL_RESET    0x8410   // dim grey
-#define COL_GREEN    0x0600   // #00C800
-#define COL_YELLOW   0xFFE0   // #FFFF00
-#define COL_ORANGE   0xFC40   // #FF8C00
-#define COL_RED      0xF840   // #FF2200
-#define COL_OFFLINE  0x4208   // dim grey
+#define COL_TEXT     0xFFFF
+#define COL_MUTED    0x8410
+#define COL_PANEL    0x1082
+#define COL_OFFLINE  0x4208
+#define ROW_TOP      16
+#define ROW_H        54
+#define X_MARGIN     8
 
-// Linearly interpolate between two RGB565 colours (t in 0..1).
-static uint16_t lerpColor565(uint16_t c0, uint16_t c1, float t) {
-    int r0 = (c0 >> 11) & 0x1F, r1 = (c1 >> 11) & 0x1F;
-    int g0 = (c0 >>  5) & 0x3F, g1 = (c1 >>  5) & 0x3F;
-    int b0 =  c0        & 0x1F, b1 =  c1        & 0x1F;
-    return (uint16_t)(((int)(r0 + t * (r1 - r0)) << 11) |
-                      ((int)(g0 + t * (g1 - g0)) <<  5) |
-                       (int)(b0 + t * (b1 - b0)));
+static uint16_t dimColor(uint16_t color) {
+    uint8_t r = ((color >> 11) & 0x1F) >> 1;
+    uint8_t g = ((color >> 5) & 0x3F) >> 1;
+    uint8_t b = (color & 0x1F) >> 1;
+    return (r << 11) | (g << 5) | b;
 }
 
-// Map usage percentage to a colour: green → yellow → orange → red.
-static uint16_t usageColor(float pct) {
-    static const uint16_t stops[4] = { COL_GREEN, COL_YELLOW, COL_ORANGE, COL_RED };
-    static const float    edges[4] = { 0.0f, 0.5f, 0.75f, 1.0f };
-    if (pct <= 0.0f) return stops[0];
-    if (pct >= 1.0f) return stops[3];
-    for (int i = 0; i < 3; i++) {
-        if (pct <= edges[i + 1]) {
-            float t = (pct - edges[i]) / (edges[i + 1] - edges[i]);
-            return lerpColor565(stops[i], stops[i + 1], t);
-        }
+static uint16_t pressureColor(float pct, uint16_t accent) {
+    if (pct >= 0.90f) return TFT_RED;
+    if (pct >= 0.70f) return 0xFD20;
+    return accent;
+}
+
+static void drawRainbowMark(int x, int y, int size) {
+    static const uint16_t colors[] = {TFT_RED, 0xFD20, TFT_YELLOW, TFT_GREEN, TFT_CYAN, TFT_BLUE, 0xA81F};
+    int stripe = max(1, size / 7);
+    for (int i = 0; i < 7; i++) {
+        tft.fillRect(x, y + i * stripe, size, stripe + 1, colors[i]);
     }
-    return stops[3];
+    tft.drawRect(x, y, size, size, TFT_WHITE);
 }
 
-// Layout (240×240)
-#define X_MARGIN     6
-#define Y_TITLE      2
-#define H_LABEL      16   // font2 row height
-#define H_BAR        20   // bar height (wider bar allows taller)
-
-#define Y_WMETER     22                           // weekly: label+reset row
-#define Y_WBAR       (Y_WMETER + H_LABEL + 2)    // 40
-#define Y_SMETER     (Y_WBAR + H_BAR + 5)        // 65
-#define Y_SBAR       (Y_SMETER + H_LABEL + 2)    // 83
-#define Y_SESSIONS   (Y_SBAR + H_BAR + 4)        // 107
-#define Y_DIVIDER    (Y_SESSIONS + H_LABEL + 3)  // 126
-#define Y_BOX        (Y_DIVIDER + 2)             // 128
-#define BOX_SIZE     (240 - Y_BOX - 4)           // 108
-
-// Two-row meter: "Label    ⟳ reset" on first row, full-width bar on second.
-static void drawMeterBlock(int labelY, const char* label, float pct,
-                           const String& resetStr) {
-    uint16_t barColor = usageColor(pct);
-    int barY = labelY + H_LABEL + 2;
-    int barX = X_MARGIN;
-    int barW = 240 - X_MARGIN * 2 - 30;   // leaves room for "100%"
-
-    // Row 1: label (left) + reset countdown (right)
-    // Text renderer fills its own character backgrounds; only clear the gap between them.
-    tft.setTextFont(2);
-    tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setCursor(X_MARGIN, labelY);
-    tft.print(label);
-    int labelRight = tft.getCursorX();
-    int resetX = 240 - X_MARGIN - tft.textWidth(resetStr);
-    if (resetX > labelRight)
-        tft.fillRect(labelRight, labelY, resetX - labelRight, H_LABEL, COL_BG);
-    tft.setTextColor(COL_RESET, COL_BG);
-    tft.setCursor(resetX, labelY);
-    tft.print(resetStr);
-
-    // Row 2: bar + percentage
-    tft.fillRect(barX, barY, barW, H_BAR, COL_BAR_BG);
-    int filled = constrain((int)(pct * barW), 0, barW);
-    if (filled > 0) tft.fillRect(barX, barY, filled, H_BAR, barColor);
-
-    char buf[6];
-    snprintf(buf, sizeof(buf), "%3d%%", (int)(pct * 100));
-    tft.setTextColor(COL_TITLE, COL_BG);
-    tft.setCursor(240 - X_MARGIN - 28, barY + 2);
-    tft.print(buf);
+static void drawCodexMark(int x, int y, int size, uint16_t accent, bool animated) {
+    int bob = animated ? (displayData.animationTick % 8 < 4 ? 1 : -1) : 0;
+    tft.fillRoundRect(x, y + bob, size, size, size / 5, dimColor(accent));
+    tft.drawRoundRect(x, y + bob, size, size, size / 5, accent);
+    tft.fillCircle(x + size / 3, y + bob + size / 3, max(1, size / 12), TFT_WHITE);
+    tft.fillCircle(x + (size * 2) / 3, y + bob + size / 3, max(1, size / 12), TFT_WHITE);
+    tft.drawFastHLine(x + size / 3, y + bob + (size * 2) / 3, size / 3, TFT_WHITE);
 }
 
-static void drawStatusBox(ClaudeStatus status, bool connected, bool authFailed) {
-    uint16_t color;
-    const char* label;
-    if (authFailed) {
-        color = COL_RED; label = "AUTH FAIL";
-    } else if (!connected) {
-        color = COL_OFFLINE; label = "OFFLINE";
-    } else switch (status) {
-        case STATUS_WORKING:  color = COL_ORANGE; label = "WORKING";  break;
-        case STATUS_WAITING:  color = COL_RED;    label = "WAITING";  break;
-        case STATUS_INACTIVE: color = COL_GREEN;  label = "IDLE";     break;
-        case STATUS_AUTH_FAILED: color = COL_RED; label = "AUTH FAIL"; break;
-        default:              color = COL_OFFLINE; label = "OFFLINE"; break;
+static void drawClaudeMark(int x, int y, int size, uint16_t accent, bool animated) {
+    int pulse = animated ? (displayData.animationTick % 10 < 5 ? 1 : 0) : 0;
+    int cx = x + size / 2;
+    int cy = y + size / 2;
+    tft.fillCircle(cx, cy, size / 3 + pulse, accent);
+    tft.fillCircle(cx - size / 5, cy, size / 6, dimColor(accent));
+    tft.fillCircle(cx + size / 5, cy, size / 6, dimColor(accent));
+    tft.fillCircle(cx, cy - size / 5, size / 6, dimColor(accent));
+    tft.fillCircle(cx, cy + size / 5, size / 6, dimColor(accent));
+}
+
+static void drawOllamaMark(int x, int y, int size, uint16_t accent) {
+    tft.fillCircle(x + size / 2, y + size / 2, size / 2, TFT_BLACK);
+    tft.drawCircle(x + size / 2, y + size / 2, size / 2 - 1, accent);
+    tft.fillTriangle(
+        x + size / 2, y + size / 5,
+        x + size / 4, y + (size * 3) / 4,
+        x + (size * 3) / 4, y + (size * 3) / 4,
+        accent);
+}
+
+static void drawProviderMark(const DisplayProviderRow& row, int x, int y, int size) {
+    if (row.rainbow || row.provider == "antigravity") {
+        drawRainbowMark(x, y, size);
+    } else if (row.provider == "codex") {
+        drawCodexMark(x, y, size, row.accent, row.animated);
+    } else if (row.provider == "claude") {
+        drawClaudeMark(x, y, size, row.accent, row.animated);
+    } else if (row.provider == "ollama") {
+        drawOllamaMark(x, y, size, row.accent);
+    } else {
+        tft.fillCircle(x + size / 2, y + size / 2, size / 2, row.accent);
     }
+}
 
-    tft.fillRect(0, Y_BOX, 240, BOX_SIZE, color);
+static void drawProviderMark(const DisplayAttention& attention, int x, int y, int size) {
+    DisplayProviderRow row;
+    row.provider = attention.provider;
+    row.mark = attention.mark;
+    row.accent = attention.accent;
+    row.background = attention.background;
+    row.pressurePct = 1.0f;
+    row.animated = attention.animated;
+    row.rainbow = attention.rainbow;
+    drawProviderMark(row, x, y, size);
+}
 
+static void drawOffline() {
+    tft.fillScreen(COL_BG);
+    tft.fillRect(0, 0, 240, 240, COL_OFFLINE);
+    const char* label = displayData.authFailed ? "AUTH" : "OFF";
     tft.setTextFont(4);
     tft.setTextSize(1);
-    tft.setTextColor(TFT_BLACK, color);
+    tft.setTextColor(TFT_BLACK, COL_OFFLINE);
     int tw = tft.textWidth(label);
-    int th = tft.fontHeight(4);
-    tft.setCursor((240 - tw) / 2, Y_BOX + (BOX_SIZE - th) / 2);
+    tft.setCursor((240 - tw) / 2, 106);
     tft.print(label);
+}
+
+static void drawAttention() {
+    uint16_t bg = displayData.attention.background == TFT_BLACK
+        ? dimColor(displayData.attention.accent)
+        : displayData.attention.background;
+    tft.fillScreen(bg);
+    drawProviderMark(displayData.attention, 50, 30, 140);
+
+    String action = displayData.attention.action.length() > 0 ? displayData.attention.action : "OPEN";
+    action.toUpperCase();
+    tft.setTextFont(4);
+    tft.setTextSize(1);
+    tft.setTextColor(COL_TEXT, bg);
+    int tw = tft.textWidth(action);
+    tft.setCursor(max(0, (240 - tw) / 2), 188);
+    tft.print(action);
+}
+
+static void drawRows() {
+    tft.fillScreen(COL_BG);
+    for (uint8_t i = 0; i < displayData.providerCount && i < MAX_DISPLAY_PROVIDERS; i++) {
+        const DisplayProviderRow& row = displayData.providers[i];
+        int y = ROW_TOP + i * ROW_H;
+        uint16_t panel = row.background == TFT_BLACK ? COL_PANEL : dimColor(row.background);
+        tft.fillRoundRect(X_MARGIN, y, 224, ROW_H - 6, 5, panel);
+        tft.fillRoundRect(X_MARGIN, y, 6, ROW_H - 6, 3, row.accent);
+        drawProviderMark(row, X_MARGIN + 14, y + 8, 32);
+
+        int barX = 58;
+        int barY = y + 20;
+        int barW = 126;
+        int barH = 10;
+        float pct = constrain(row.pressurePct, 0.0f, 1.0f);
+        uint16_t fill = pressureColor(pct, row.accent);
+        tft.fillRect(barX, barY, barW, barH, COL_BG);
+        tft.fillRect(barX, barY, (int)(barW * pct), barH, fill);
+
+        char buf[6];
+        snprintf(buf, sizeof(buf), "%3d%%", (int)(pct * 100.0f + 0.5f));
+        tft.setTextFont(2);
+        tft.setTextSize(1);
+        tft.setTextColor(COL_TEXT, panel);
+        tft.setCursor(190, y + 16);
+        tft.print(buf);
+    }
+
+    if (displayData.providerCount == 0) {
+        tft.setTextFont(4);
+        tft.setTextSize(1);
+        tft.setTextColor(COL_MUTED, COL_BG);
+        tft.setCursor(55, 106);
+        tft.print("NO DATA");
+    }
 }
 
 void displayInit() {
@@ -123,74 +184,27 @@ void displayInit() {
     tft.fillScreen(COL_BG);
     pinMode(TFT_BL, OUTPUT);
     digitalWrite(TFT_BL, LOW);   // active LOW = backlight on
-
-    // Static elements — drawn once, never change
-    tft.setTextFont(2);
-    tft.setTextSize(1);
-    tft.setTextColor(COL_TITLE, COL_BG);
-    tft.setCursor(X_MARGIN, Y_TITLE);
-    tft.print("codelight");
-    tft.drawFastHLine(0, Y_DIVIDER, 240, COL_BAR_BG);
 }
 
 void displayUpdate() {
-    static DisplayData prev = {-1.0f, -1.0f, "", "", -1, (ClaudeStatus)-1, false, false};
-
-    if (displayData.weeklyPct != prev.weeklyPct || displayData.weeklyReset != prev.weeklyReset)
-        drawMeterBlock(Y_WMETER, "Weekly", displayData.weeklyPct, displayData.weeklyReset);
-
-    if (displayData.sessionPct != prev.sessionPct || displayData.sessionReset != prev.sessionReset)
-        drawMeterBlock(Y_SMETER, "Session", displayData.sessionPct, displayData.sessionReset);
-
-    if (displayData.sessions != prev.sessions) {
-        tft.setTextFont(2);
-        tft.setTextSize(1);
-        tft.setTextColor(COL_LABEL, COL_BG);
-        tft.setCursor(X_MARGIN, Y_SESSIONS);
-        char sbuf[24];
-        snprintf(sbuf, sizeof(sbuf), "%d session%s active",
-                 displayData.sessions, displayData.sessions == 1 ? "" : "s");
-        tft.print(sbuf);
-        tft.fillRect(tft.getCursorX(), Y_SESSIONS, 240 - tft.getCursorX(), H_LABEL, COL_BG);
+    displayData.animationTick++;
+    if (displayData.authFailed || !displayData.connected) {
+        drawOffline();
+    } else if (displayData.attention.active) {
+        drawAttention();
+    } else {
+        drawRows();
     }
-
-    if (displayData.status != prev.status || displayData.connected != prev.connected ||
-        displayData.authFailed != prev.authFailed)
-        drawStatusBox(displayData.status, displayData.connected, displayData.authFailed);
-
-    prev = displayData;
-
     displayUpdateClock();
 }
 
-// ── SVG screen dump ───────────────────────────────────────────────────────────
-
-static String rgb888Hex(uint8_t r, uint8_t g, uint8_t b) {
+static String colorHex(uint16_t color) {
+    uint8_t r = ((color >> 11) & 0x1F) << 3;
+    uint8_t g = ((color >> 5) & 0x3F) << 2;
+    uint8_t b = (color & 0x1F) << 3;
     char buf[8];
     snprintf(buf, sizeof(buf), "#%02x%02x%02x", r, g, b);
     return String(buf);
-}
-
-static String usageColorHex(float pct) {
-    struct Stop { float edge; uint8_t r, g, b; };
-    static const Stop stops[4] = {
-        {0.00f,   0, 200,   0},
-        {0.50f, 255, 255,   0},
-        {0.75f, 255, 140,   0},
-        {1.00f, 255,  34,   0},
-    };
-    if (pct <= 0.0f) return rgb888Hex(stops[0].r, stops[0].g, stops[0].b);
-    if (pct >= 1.0f) return rgb888Hex(stops[3].r, stops[3].g, stops[3].b);
-    for (int i = 0; i < 3; i++) {
-        if (pct <= stops[i+1].edge) {
-            float t = (pct - stops[i].edge) / (stops[i+1].edge - stops[i].edge);
-            return rgb888Hex(
-                (uint8_t)(stops[i].r + t*(stops[i+1].r - stops[i].r)),
-                (uint8_t)(stops[i].g + t*(stops[i+1].g - stops[i].g)),
-                (uint8_t)(stops[i].b + t*(stops[i+1].b - stops[i].b)));
-        }
-    }
-    return "#ff2200";
 }
 
 static void svgText(String& s, int x, int y, const char* fill, int sz,
@@ -199,94 +213,43 @@ static void svgText(String& s, int x, int y, const char* fill, int sz,
     s += "' fill='"; s += fill;
     s += "' font-family='monospace' font-size='"; s += sz; s += "'";
     if (anchor) { s += " text-anchor='"; s += anchor; s += "'"; }
-    s += '>'; s += text; s += "</text>";
-}
-
-static void svgMeter(String& s, int labelY, const char* label, float pct,
-                     const String& resetStr) {
-    int barY  = labelY + H_LABEL + 2;
-    int barW  = 240 - X_MARGIN * 2 - 30;
-    int filled = constrain((int)(pct * barW), 0, barW);
-
-    svgText(s, X_MARGIN,      labelY + 13, "#c0c0c0", 13, nullptr,  label);
-    svgText(s, 234,           labelY + 13, "#808080", 13, "end",     resetStr);
-
-    s += "<rect x='"; s += X_MARGIN; s += "' y='"; s += barY;
-    s += "' width='"; s += barW;     s += "' height='"; s += H_BAR; s += "' fill='#202020'/>";
-
-    if (filled > 0) {
-        s += "<rect x='"; s += X_MARGIN; s += "' y='"; s += barY;
-        s += "' width='"; s += filled; s += "' height='"; s += H_BAR;
-        s += "' fill='"; s += usageColorHex(pct); s += "'/>";
-    }
-
-    char buf[6]; snprintf(buf, sizeof(buf), "%d%%", (int)(pct * 100));
-    svgText(s, 234, barY + 14, "#ffffff", 13, "end", buf);
+    s += ">"; s += text; s += "</text>";
 }
 
 String generateScreenSvg() {
     String s;
-    s.reserve(1500);
-
-    s  = "<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'>";
+    s.reserve(1800);
+    s = "<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'>";
     s += "<rect width='240' height='240' fill='#000'/>";
 
-    // Title + clock
-    svgText(s, X_MARGIN, Y_TITLE + 13, "#ffffff", 13, nullptr, "codelight");
-    time_t now = time(nullptr);
-    struct tm* tm_ = localtime(&now);
-    char clk[10];
-    snprintf(clk, sizeof(clk), "%02d:%02d:%02d", tm_->tm_hour, tm_->tm_min, tm_->tm_sec);
-    svgText(s, 234, Y_TITLE + 13, "#ffffff", 13, "end", clk);
-
-    // Meter bars
-    svgMeter(s, Y_WMETER, "Weekly",  displayData.weeklyPct,  displayData.weeklyReset);
-    svgMeter(s, Y_SMETER, "Session", displayData.sessionPct, displayData.sessionReset);
-
-    // Session count
-    char sbuf[24];
-    snprintf(sbuf, sizeof(sbuf), "%d session%s active",
-             displayData.sessions, displayData.sessions == 1 ? "" : "s");
-    svgText(s, X_MARGIN, Y_SESSIONS + 13, "#c0c0c0", 13, nullptr, sbuf);
-
-    // Divider
-    s += "<line x1='0' y1='"; s += Y_DIVIDER;
-    s += "' x2='240' y2='"; s += Y_DIVIDER; s += "' stroke='#202020'/>";
-
-    // Status box
-    const char* sc; const char* sl;
-    if (displayData.authFailed) {
-        sc = "#ff2200"; sl = "AUTH FAIL";
-    } else if (!displayData.connected) {
-        sc = "#404040"; sl = "OFFLINE";
-    } else switch (displayData.status) {
-        case STATUS_WORKING:  sc = "#ff8c00"; sl = "WORKING";  break;
-        case STATUS_WAITING:  sc = "#ff2200"; sl = "WAITING";  break;
-        case STATUS_INACTIVE: sc = "#00c800"; sl = "IDLE";     break;
-        default:              sc = "#404040"; sl = "OFFLINE";  break;
+    if (displayData.authFailed || !displayData.connected) {
+        s += "<rect width='240' height='240' fill='#404040'/>";
+        svgText(s, 120, 128, "#000", 28, "middle", displayData.authFailed ? "AUTH" : "OFF");
+    } else if (displayData.attention.active) {
+        s += "<rect width='240' height='240' fill='"; s += colorHex(displayData.attention.background); s += "'/>";
+        svgText(s, 120, 120, colorHex(displayData.attention.accent).c_str(), 72, "middle", displayData.attention.mark);
+        svgText(s, 120, 210, "#fff", 22, "middle", displayData.attention.action);
+    } else {
+        for (uint8_t i = 0; i < displayData.providerCount && i < MAX_DISPLAY_PROVIDERS; i++) {
+            const DisplayProviderRow& row = displayData.providers[i];
+            int y = ROW_TOP + i * ROW_H;
+            int filled = (int)(126 * constrain(row.pressurePct, 0.0f, 1.0f));
+            s += "<rect x='8' y='"; s += y; s += "' width='224' height='48' rx='5' fill='"; s += colorHex(dimColor(row.background)); s += "'/>";
+            s += "<rect x='8' y='"; s += y; s += "' width='6' height='48' fill='"; s += colorHex(row.accent); s += "'/>";
+            svgText(s, 38, y + 33, colorHex(row.accent).c_str(), 24, "middle", row.mark);
+            s += "<rect x='58' y='"; s += (y + 20); s += "' width='126' height='10' fill='#000'/>";
+            s += "<rect x='58' y='"; s += (y + 20); s += "' width='"; s += filled; s += "' height='10' fill='"; s += colorHex(pressureColor(row.pressurePct, row.accent)); s += "'/>";
+            char buf[6];
+            snprintf(buf, sizeof(buf), "%d%%", (int)(row.pressurePct * 100.0f + 0.5f));
+            svgText(s, 218, y + 32, "#fff", 13, "end", buf);
+        }
     }
-    s += "<rect x='0' y='"; s += Y_BOX;
-    s += "' width='240' height='"; s += BOX_SIZE;
-    s += "' fill='"; s += sc; s += "'/>";
-    s += "<text x='120' y='"; s += (Y_BOX + BOX_SIZE/2 + 8);
-    s += "' fill='#000' font-family='sans-serif' font-size='20' font-weight='bold'"
-         " text-anchor='middle'>"; s += sl; s += "</text>";
-
     s += "</svg>";
     return s;
 }
 
 void displayUpdateClock() {
-    time_t now = time(nullptr);
-    struct tm* t = localtime(&now);
-
-    char buf[10];
-    snprintf(buf, sizeof(buf), "%02d:%02d:%02d", t->tm_hour, t->tm_min, t->tm_sec);
-
-    tft.setTextFont(2);
-    tft.setTextSize(1);
-    tft.setTextColor(COL_TITLE, COL_BG);
-    int tw = tft.textWidth(buf);
-    tft.setCursor(240 - X_MARGIN - tw, Y_TITLE);
-    tft.print(buf);
+    if (displayData.attention.active) {
+        displayData.animationTick++;
+    }
 }

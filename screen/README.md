@@ -122,26 +122,43 @@ mode and shows setup instructions on screen:
 5. Set a **companion name** — the `--name` value of the `codelight.py` daemon you
    want to connect to (e.g. `henrik-laptop`). Leave blank to connect to the first
    companion found on the network.
-6. Optionally set a **companion host** — the IP address of the machine running
-   `codelight.py` (e.g. `192.168.1.100`). When set, mDNS discovery is skipped and
-   the screen connects directly. Useful if mDNS is unreliable on your network.
-7. Optionally set a **companion secret** to match `--secret` on the daemon.
+6. Optionally set a **companion host** — the IP address of the Windows machine
+   running WinProdexBar, or the machine running `codelight.py` (e.g.
+   `192.168.1.100`). When set, mDNS discovery is skipped. In WinProdexBar mode
+   the screen polls `http://<host>:8080/display?provider=all`.
+7. Optionally set a **companion secret** to match `--device-secret` on
+   WinProdexBar or `--secret` on the daemon.
 8. Click **Save & apply**. The device reboots, connects to your network, and
    discovers the companion automatically via mDNS (or directly if a host is set).
 
 Config is stored in LittleFS and survives firmware OTA updates.
 
+### WinProdexBar direct mode
+
+On Windows, run WinProdexBar's local server on your LAN with a shared secret:
+
+```powershell
+codexbar serve --host 0.0.0.0 --device-secret my-screen-secret --attention-file $env:APPDATA\CodexBar\attention.json
+```
+
+Then set the screen's companion host to the Windows machine's LAN IP and the
+companion secret to `my-screen-secret`. The display polls `/display` every 30
+seconds, ranks Codex, Claude, Ollama, and Antigravity by quota pressure, and
+switches to takeover mode when the optional attention file names `codex` or
+`claude`.
+
 ## How it connects
 
-On boot the screen connects to the companion daemon over WebSocket:
+On boot the screen connects to its configured data source:
 
-- **Direct IP** (if *companion host* is set): connects immediately without mDNS.
+- **WinProdexBar direct HTTP** (if *companion host* is set): polls `/display`
+  immediately without mDNS.
 - **mDNS discovery** (default): queries for `_codelight._tcp` services, filtered by
-  companion name if configured.
+  companion name if configured, then connects to the legacy WebSocket companion.
 
-Once connected it receives push updates in real time. If the connection drops it
-reconnects automatically after 15 seconds. The timezone offset is pushed by the
-companion on every new connection so the clock always shows the correct local time.
+In WinProdexBar direct mode, the screen refreshes every 30 seconds. In legacy
+WebSocket mode it receives push updates in real time and reconnects automatically
+after 15 seconds.
 
 ## Debug page
 
