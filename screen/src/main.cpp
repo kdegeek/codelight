@@ -158,6 +158,7 @@ static void pollDisplayFeed() {
         dbgLog(F("[http] begin failed"));
         return;
     }
+    http.setTimeout(20000);
 
     int code = http.GET();
     if (code == HTTP_CODE_OK) {
